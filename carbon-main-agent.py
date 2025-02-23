@@ -12,7 +12,26 @@ sqs = boto3.client('sqs')
 
 # Constants
 TABLE_NAME = 'carbon-assistant-data'
-QUEUE_URL = 'https://sqs.[your-region].amazonaws.com/[your-account-id]/carbon-bedrock-queue'
+QUEUE_URL = 'https://sqs.us-east-1.amazonaws.com/[your-account-id]/carbon-bedrock-queue'
+
+def store_conversation(conversation_id, user_input, response):
+    """Store conversation in DynamoDB with proper formatting"""
+    try:
+        table = dynamodb.Table(TABLE_NAME)
+        timestamp = str(int(datetime.now().timestamp() * 1000))
+        
+        item = {
+            'conversationId': conversation_id,
+            'timestamp': timestamp,
+            'userInput': user_input,
+            'response': response,
+            'type': 'conversation'
+        }
+        
+        table.put_item(Item=item)
+    except Exception as e:
+        print(f"DynamoDB error: {str(e)}")
+        return None
 
 def enqueue_request(prompt, conversation_id):
     """Add request to SQS queue when throttled"""
@@ -33,7 +52,6 @@ def enqueue_request(prompt, conversation_id):
                 }
             }
         )
-        
         return True
     except Exception as e:
         print(f"SQS error: {str(e)}")
@@ -68,12 +86,24 @@ def invoke_bedrock_with_queue(prompt, conversation_id):
         
     except Exception as e:
         if "ThrottlingException" in str(e):
-            # Enqueue the request
             if enqueue_request(prompt, conversation_id):
                 return {
                     'status': 'queued',
-                    'response': "Your request has been queued due to high demand. You'll receive a response shortly. In the meantime, here's some general information about carbon emissions and energy efficiency..."
+                    'response': "Your request has been queued due to high demand. You'll receive a response shortly via our notification system. In the meantime, here's some general guidance: Carbon emissions from electricity usage depend on your region's energy mix and the time of consumption. Consider implementing energy efficiency measures and shifting usage to off-peak hours when possible."
                 }
+        raise
+
+def invoke_calculation_agent(query):
+    """Invoke the calculation Lambda function"""
+    try:
+        response = lambda_client.invoke(
+            FunctionName='carbon-calculation-agent',
+            InvocationType='RequestResponse',
+            Payload=json.dumps({'query': query})
+        )
+        return json.loads(response['Payload'].read())
+    except Exception as e:
+        print(f"Calculation agent invocation error: {str(e)}")
         raise
 
 def lambda_handler(event, context):
