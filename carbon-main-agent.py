@@ -12,10 +12,10 @@ sqs = boto3.client('sqs')
 
 # Constants
 TABLE_NAME = 'carbon-assistant-data'
-QUEUE_URL = 'https://sqs.us-east-1.amazonaws.com/[your-account-id]/carbon-bedrock-queue'
+QUEUE_URL = 'https://sqs.us-east-1.amazonaws.com/717279723101/carbon-bedrock-queue'
 
 def store_conversation(conversation_id, user_input, response):
-    """Store conversation in DynamoDB with proper formatting"""
+    """Store conversation in DynamoDB"""
     try:
         table = dynamodb.Table(TABLE_NAME)
         timestamp = str(int(datetime.now().timestamp() * 1000))
@@ -29,69 +29,49 @@ def store_conversation(conversation_id, user_input, response):
         }
         
         table.put_item(Item=item)
-    except Exception as e:
-        print(f"DynamoDB error: {str(e)}")
-        return None
-
-def enqueue_request(prompt, conversation_id):
-    """Add request to SQS queue when throttled"""
-    try:
-        message_body = {
-            'prompt': prompt,
-            'conversation_id': conversation_id,
-            'timestamp': str(int(datetime.now().timestamp() * 1000))
-        }
-        
-        sqs.send_message(
-            QueueUrl=QUEUE_URL,
-            MessageBody=json.dumps(message_body),
-            MessageAttributes={
-                'RequestType': {
-                    'DataType': 'String',
-                    'StringValue': 'bedrock_inference'
-                }
-            }
-        )
         return True
     except Exception as e:
-        print(f"SQS error: {str(e)}")
+        print(f"DynamoDB error: {str(e)}")
         return False
 
-def invoke_bedrock_with_queue(prompt, conversation_id):
-    """Try direct invocation, fall back to queue if throttled"""
-    try:
-        request_body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 500,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": prompt}]
-                }
-            ]
-        }
-        
-        response = bedrock.invoke_model(
-            modelId='anthropic.claude-3-5-sonnet-20240620-v1:0',
-            contentType='application/json',
-            accept='application/json',
-            body=json.dumps(request_body)
-        )
-        
-        response_body = json.loads(response['body'].read().decode())
-        return {
-            'status': 'direct',
-            'response': response_body['content'][0]['text']
-        }
-        
-    except Exception as e:
-        if "ThrottlingException" in str(e):
-            if enqueue_request(prompt, conversation_id):
-                return {
-                    'status': 'queued',
-                    'response': "Your request has been queued due to high demand. You'll receive a response shortly via our notification system. In the meantime, here's some general guidance: Carbon emissions from electricity usage depend on your region's energy mix and the time of consumption. Consider implementing energy efficiency measures and shifting usage to off-peak hours when possible."
-                }
-        raise
+def invoke_bedrock_with_retry(prompt, max_retries=5, base_delay=0.5):
+    """Invoke Bedrock with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            request_body = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 500,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": prompt}]
+                    }
+                ]
+            }
+            
+            response = bedrock.invoke_model(
+                modelId='anthropic.claude-3-5-sonnet-20240620-v1:0',
+                contentType='application/json',
+                accept='application/json',
+                body=json.dumps(request_body)
+            )
+            
+            response_body = json.loads(response['body'].read().decode())
+            return {
+                'success': True,
+                'response': response_body['content'][0]['text']
+            }
+            
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = base_delay * (2 ** attempt)
+                time.sleep(wait_time)
+                continue
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
 def invoke_calculation_agent(query):
     """Invoke the calculation Lambda function"""
@@ -103,10 +83,11 @@ def invoke_calculation_agent(query):
         )
         return json.loads(response['Payload'].read())
     except Exception as e:
-        print(f"Calculation agent invocation error: {str(e)}")
+        print(f"Calculation agent error: {str(e)}")
         raise
 
 def lambda_handler(event, context):
+    """Main Lambda handler function"""
     try:
         # Extract input from event
         body = json.loads(event.get('body', '{}'))
@@ -120,39 +101,52 @@ def lambda_handler(event, context):
                 'body': json.dumps({'error': 'Input is required'})
             }
         
-        # Process query with queue fallback
-        if "carbon" in user_input.lower() or "emission" in user_input.lower():
-            try:
+        # Process query
+        try:
+            if "carbon" in user_input.lower() or "emission" in user_input.lower():
                 calc_results = invoke_calculation_agent(user_input)
                 prompt = f"Explain these carbon emission calculation results briefly and clearly: {calc_results}"
-            except Exception:
-                prompt = f"Provide general guidance about carbon emissions for {user_input}. Keep it brief."
+            else:
+                prompt = user_input
                 
-            result = invoke_bedrock_with_queue(prompt, conversation_id)
+            result = invoke_bedrock_with_retry(prompt)
             
-        else:
-            result = invoke_bedrock_with_queue(user_input, conversation_id)
-        
-        # Store conversation if direct response
-        if result['status'] == 'direct':
-            store_conversation(conversation_id, user_input, result['response'])
-        
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({
-                'response': result['response'],
-                'conversationId': conversation_id,
-                'status': result['status']
-            })
-        }
-        
+            if result['success']:
+                store_conversation(conversation_id, user_input, result['response'])
+                return {
+                    'statusCode': 200,
+                    'headers': {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    },
+                    'body': json.dumps({
+                        'response': result['response'],
+                        'conversationId': conversation_id
+                    })
+                }
+            else:
+                return {
+                    'statusCode': 500,
+                    'headers': {'Content-Type': 'application/json'},
+                    'body': json.dumps({
+                        'error': f"Failed to process request: {result['error']}"
+                    })
+                }
+                
+        except Exception as e:
+            return {
+                'statusCode': 500,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({
+                    'error': f"Error processing request: {str(e)}"
+                })
+            }
+            
     except Exception as e:
         return {
             'statusCode': 500,
             'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({'error': str(e)})
+            'body': json.dumps({
+                'error': f"Error parsing request: {str(e)}"
+            })
         }
