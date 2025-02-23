@@ -3,100 +3,86 @@ import boto3
 from datetime import datetime
 import uuid
 import time
-import asyncio
-import concurrent.futures
 
-# Initialize AWS clients outside the handler for reuse
+# Initialize AWS clients
 bedrock = boto3.client('bedrock-runtime')
 dynamodb = boto3.resource('dynamodb')
 lambda_client = boto3.client('lambda')
+sqs = boto3.client('sqs')
 
+# Constants
 TABLE_NAME = 'carbon-assistant-data'
+QUEUE_URL = 'https://sqs.[your-region].amazonaws.com/[your-account-id]/carbon-bedrock-queue'
 
-def store_conversation(conversation_id, user_input, response):
-    """Store conversation in DynamoDB with proper formatting"""
+def enqueue_request(prompt, conversation_id):
+    """Add request to SQS queue when throttled"""
     try:
-        table = dynamodb.Table(TABLE_NAME)
-        timestamp = str(int(datetime.now().timestamp() * 1000))
-        
-        item = {
-            'conversationId': conversation_id,
-            'timestamp': timestamp,
-            'userInput': user_input,
-            'response': response,
-            'type': 'conversation'
+        message_body = {
+            'prompt': prompt,
+            'conversation_id': conversation_id,
+            'timestamp': str(int(datetime.now().timestamp() * 1000))
         }
         
-        # Use PutItem with minimal attributes to speed up write
-        table.put_item(Item=item)
-    except Exception as e:
-        print(f"DynamoDB error: {str(e)}")
-        # Don't raise the error, just log it and continue
-        return None
-
-def invoke_bedrock_with_retry(prompt, max_retries=2, initial_delay=0.5):
-    """Optimized Bedrock invocation with faster retry"""
-    last_exception = None
-    
-    for attempt in range(max_retries):
-        try:
-            request_body = {
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 500,  # Reduced for faster response
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [{"type": "text", "text": prompt}]
-                    }
-                ]
+        sqs.send_message(
+            QueueUrl=QUEUE_URL,
+            MessageBody=json.dumps(message_body),
+            MessageAttributes={
+                'RequestType': {
+                    'DataType': 'String',
+                    'StringValue': 'bedrock_inference'
+                }
             }
-            
-            response = bedrock.invoke_model(
-                modelId='anthropic.claude-3-5-sonnet-20240620-v1:0',
-                contentType='application/json',
-                accept='application/json',
-                body=json.dumps(request_body)
-            )
-            
-            response_body = json.loads(response['body'].read().decode())
-            return response_body['content'][0]['text']
-            
-        except Exception as e:
-            last_exception = e
-            if attempt < max_retries - 1:
-                time.sleep(initial_delay)
-                initial_delay *= 2
-                continue
-            
-    # If we get here, all retries failed
-    return f"I apologize, but I'm experiencing some technical difficulties. Please try again in a moment. Error: {str(last_exception)}"
-
-def invoke_calculation_agent(query):
-    """Invoke calculation Lambda with timeout"""
-    try:
-        response = lambda_client.invoke(
-            FunctionName='carbon-calculation-agent',
-            InvocationType='RequestResponse',
-            Payload=json.dumps({'query': query}),
         )
-        return json.loads(response['Payload'].read())
+        
+        return True
     except Exception as e:
-        print(f"Calculation error: {str(e)}")
-        return None
+        print(f"SQS error: {str(e)}")
+        return False
+
+def invoke_bedrock_with_queue(prompt, conversation_id):
+    """Try direct invocation, fall back to queue if throttled"""
+    try:
+        request_body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 500,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}]
+                }
+            ]
+        }
+        
+        response = bedrock.invoke_model(
+            modelId='anthropic.claude-3-5-sonnet-20240620-v1:0',
+            contentType='application/json',
+            accept='application/json',
+            body=json.dumps(request_body)
+        )
+        
+        response_body = json.loads(response['body'].read().decode())
+        return {
+            'status': 'direct',
+            'response': response_body['content'][0]['text']
+        }
+        
+    except Exception as e:
+        if "ThrottlingException" in str(e):
+            # Enqueue the request
+            if enqueue_request(prompt, conversation_id):
+                return {
+                    'status': 'queued',
+                    'response': "Your request has been queued due to high demand. You'll receive a response shortly. In the meantime, here's some general information about carbon emissions and energy efficiency..."
+                }
+        raise
 
 def lambda_handler(event, context):
     try:
-        start_time = time.time()
-        
         # Extract input from event
         body = json.loads(event.get('body', '{}'))
         user_input = body.get('input', '')
         conversation_id = body.get('conversationId', str(uuid.uuid4()))
         
-        # Set timeout threshold
-        TIMEOUT_THRESHOLD = 25  # seconds
-        
-        # Quick validation
         if not user_input:
             return {
                 'statusCode': 400,
@@ -104,31 +90,22 @@ def lambda_handler(event, context):
                 'body': json.dumps({'error': 'Input is required'})
             }
         
-        # Process query with timeout awareness
+        # Process query with queue fallback
         if "carbon" in user_input.lower() or "emission" in user_input.lower():
-            # Calculate remaining time
-            elapsed_time = time.time() - start_time
-            if elapsed_time > TIMEOUT_THRESHOLD:
-                raise TimeoutError("Processing time exceeded")
+            try:
+                calc_results = invoke_calculation_agent(user_input)
+                prompt = f"Explain these carbon emission calculation results briefly and clearly: {calc_results}"
+            except Exception:
+                prompt = f"Provide general guidance about carbon emissions for {user_input}. Keep it brief."
                 
-            calc_results = invoke_calculation_agent(user_input)
+            result = invoke_bedrock_with_queue(prompt, conversation_id)
             
-            # If calculation succeeds
-            if calc_results:
-                response = invoke_bedrock_with_retry(
-                    f"Explain these carbon emission calculation results briefly and clearly: {calc_results}"
-                )
-            else:
-                response = invoke_bedrock_with_retry(
-                    f"I couldn't calculate exact emissions, but here's guidance about carbon emissions for {user_input}. Keep it brief."
-                )
         else:
-            response = invoke_bedrock_with_retry(user_input)
+            result = invoke_bedrock_with_queue(user_input, conversation_id)
         
-        # Async store conversation if time permits
-        elapsed_time = time.time() - start_time
-        if elapsed_time < TIMEOUT_THRESHOLD:
-            store_conversation(conversation_id, user_input, response)
+        # Store conversation if direct response
+        if result['status'] == 'direct':
+            store_conversation(conversation_id, user_input, result['response'])
         
         return {
             'statusCode': 200,
@@ -137,20 +114,12 @@ def lambda_handler(event, context):
                 'Access-Control-Allow-Origin': '*'
             },
             'body': json.dumps({
-                'response': response,
-                'conversationId': conversation_id
+                'response': result['response'],
+                'conversationId': conversation_id,
+                'status': result['status']
             })
         }
         
-    except TimeoutError:
-        return {
-            'statusCode': 200,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({
-                'response': "I apologize, but the request is taking longer than expected. Please try again with a simpler query.",
-                'conversationId': conversation_id
-            })
-        }
     except Exception as e:
         return {
             'statusCode': 500,
