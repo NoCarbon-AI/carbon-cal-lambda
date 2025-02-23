@@ -10,7 +10,7 @@ sqs = boto3.client('sqs')
 
 # Constants
 TABLE_NAME = 'carbon-assistant-data'
-QUEUE_URL = 'https://sqs.us-east-1.amazonaws.com/[your-account-id]/carbon-bedrock-queue'
+QUEUE_URL = 'https://sqs.us-east-1.amazonaws.com/717279723101/carbon-bedrock-queue'
 
 def process_bedrock_request(prompt):
     """Process Bedrock request with retries"""
